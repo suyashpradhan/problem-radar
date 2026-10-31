@@ -81,3 +81,63 @@ class DatabaseTest(unittest.TestCase):
   with app.conn() as c:
    self.assertEqual(c.execute('SELECT count(*) FROM evidence').fetchone()[0],1)
    self.assertEqual([r['name'] for r in c.execute('PRAGMA table_info(evidence)') if r['pk']],['id','topic'])
+
+ def market_row(self, **changes):
+  row=dict(pricing_status='verified',pricing='$20/month',verified_on=app.now()[:10],
+           url='https://vendor.example',pricing_url='https://vendor.example/pricing',
+           complaint='Missing feature',complaint_url='https://forum.example/post/1',
+           complaint_published='2026-01-01',complaint_kind='independent_complaint')
+  row.update(changes)
+  return row
+
+ def test_pricing_requires_explicit_current_vendor_verification(self):
+  self.assertTrue(app.pricing_verified(self.market_row()))
+  for change in [dict(pricing_status='unverified'),dict(verified_on='2020-01-01'),
+                 dict(verified_on='2999-01-01'),dict(pricing_url='https://review.example'),
+                 dict(pricing=''),dict(verified_on='bad')]:
+   self.assertFalse(app.pricing_verified(self.market_row(**change)))
+
+ def test_complaints_require_manual_classification_date_and_external_source(self):
+  self.assertTrue(app.complaint_verified(self.market_row()))
+  for change in [dict(complaint_kind='vendor_marketing'),dict(complaint_published=''),
+                 dict(complaint_url='https://vendor.example/testimonial'),dict(complaint='')]:
+   self.assertFalse(app.complaint_verified(self.market_row(**change)))
+
+ def post(self, path, data):
+  import io, json
+  handler=object.__new__(app.Handler)
+  body=json.dumps(data).encode()
+  handler.headers={'Content-Length':str(len(body))}
+  handler.rfile=io.BytesIO(body)
+  handler.path=path
+  with patch.object(handler,'send') as send:handler.do_POST()
+  return send.call_args.args
+
+ def test_api_rejects_non_object_and_invalid_fields(self):
+  for data in [[],None,{'topic':[]},{'topic':123}]:
+   self.assertEqual(self.post('/api/scan',data)[1],400)
+
+ def test_research_workflow_and_edit(self):
+  topic=next(iter(app.TOPICS))
+  payload=dict(self.market_row(),topic=topic,name='Vendor',kind='paid')
+  self.assertEqual(self.post('/api/competitors',payload)[0],{'ok':True})
+  row=app.competitors(topic)[0]
+  self.assertTrue(row['pricing_current'])
+  payload.update(id=str(row['id']),pricing_status='unverified')
+  self.post('/api/competitors',payload)
+  self.assertEqual(len(app.competitors(topic)),1)
+  self.assertFalse(app.competitors(topic)[0]['pricing_current'])
+  self.post('/api/decision',dict(topic=topic,status='Needs research',target_buyer='Bookkeeper',underserved_gap='Unknown',next_step='Interview',notes='No go yet'))
+  self.assertEqual(app.overview()['topics'][0]['target_buyer'],'Bookkeeper')
+
+ def test_keyword_matches_and_duplicate_vendors_do_not_pass_gate(self):
+  topic=next(iter(app.TOPICS))
+  for _ in range(3):self.post('/api/competitors',dict(self.market_row(),topic=topic,name='Vendor',kind='paid'))
+  group=app.overview()['topics'][0]
+  self.assertEqual(group['paid_priced'],1)
+  self.assertEqual(group['competitor_complaints'],1)
+  self.assertEqual(group['gate'],'Needs more independent complaints')
+
+ def test_seed_does_not_claim_verification(self):
+  app.seed()
+  self.assertEqual(app.competitors(next(iter(app.TOPICS))),[])

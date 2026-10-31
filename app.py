@@ -47,6 +47,14 @@ def init():
     COMMIT;""")
   c.executescript("""CREATE TABLE IF NOT EXISTS source_health(source TEXT PRIMARY KEY,next_allowed REAL NOT NULL DEFAULT 0,status TEXT,last_attempt TEXT,last_error TEXT);
    CREATE TABLE IF NOT EXISTS collection_requests(id INTEGER PRIMARY KEY,run_id INTEGER NOT NULL,source TEXT NOT NULL,topic TEXT NOT NULL,query TEXT NOT NULL,status TEXT NOT NULL,found INTEGER DEFAULT 0,added INTEGER DEFAULT 0,error TEXT DEFAULT '',attempted_at TEXT NOT NULL);""")
+  for table, fields in {
+   'competitors': {'pricing_status': "TEXT NOT NULL DEFAULT 'unverified'", 'complaint_kind': "TEXT NOT NULL DEFAULT 'anecdote'", 'complaint_published': "TEXT NOT NULL DEFAULT ''"},
+   'evidence': {'review_kind': "TEXT NOT NULL DEFAULT 'unreviewed'"},
+   'decisions': {'target_buyer': "TEXT NOT NULL DEFAULT ''", 'underserved_gap': "TEXT NOT NULL DEFAULT ''", 'next_step': "TEXT NOT NULL DEFAULT ''"},
+  }.items():
+   columns={r['name'] for r in c.execute('PRAGMA table_info('+table+')')}
+   for name, definition in fields.items():
+    if name not in columns: c.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
   for slug in TOPICS: c.execute('INSERT OR IGNORE INTO decisions(topic,status,updated_at) VALUES(?,?,?)',(slug,'Discovery',now()))
 
 def request_json(url,headers=None):
@@ -161,12 +169,13 @@ def overview():
   items=[r for r in rows if r['topic']==slug]
   distinct=len({r['author']+'@'+r['source'] if r['author'] else r['id'] for r in items})
   pain=sum(bool(PAIN.search((r['title'] or '')+' '+(r['body'] or ''))) for r in items)
-  paid=sum(1 for r in comps if r['topic']==slug and r['kind']=='paid' and r['pricing_url'])
+  paid=len({host(r['url']) for r in comps if r['topic']==slug and r['kind']=='paid' and pricing_verified(r)})
+  reviewed=len({r['author']+'@'+r['source'] for r in items if r['author'] and r['review_kind']=='independent_complaint'})
   free=sum(1 for r in comps if r['topic']==slug and r['kind']=='free')
-  complaints=sum(1 for r in comps if r['topic']==slug and r['complaint_url'])
+  complaints=len({r['complaint_url'].split('#')[0].rstrip('/') for r in comps if r['topic']==slug and complaint_verified(r)})
   # A conservative evidence gate. Status never automatically becomes 'build'.
-  gate='Needs more independent complaints' if pain<5 or distinct<5 else 'Research competitor pricing' if paid<3 else 'Research free alternatives' if not free else 'Research customer complaints' if complaints<2 else 'Customer interviews required'
-  groups.append({'slug':slug,'label':t['label'],'description':t['description'],'sources':len(items),'unique_authors':distinct,'pain_signals':pain,'paid_priced':paid,'free_alternatives':free,'competitor_complaints':complaints,'gate':gate,'status':dec[slug]['status'],'notes':dec[slug]['notes']})
+  gate='Needs more independent complaints' if reviewed<5 else 'Research competitor pricing' if paid<3 else 'Research free alternatives' if not free else 'Research customer complaints' if complaints<2 else 'Customer interviews required'
+  groups.append({'slug':slug,'label':t['label'],'description':t['description'],'sources':len(items),'unique_authors':distinct,'pain_signals':pain,'reviewed_complaint_authors':reviewed,'paid_priced':paid,'free_alternatives':free,'competitor_complaints':complaints,'gate':gate,'status':dec[slug]['status'],'notes':dec[slug]['notes'],'target_buyer':dec[slug]['target_buyer'],'underserved_gap':dec[slug]['underserved_gap'],'next_step':dec[slug]['next_step']})
  return {'topics':groups,'runs':runs,'source_health':health,'total_evidence':len(rows),'source_counts':dict((s,sum(r['source']==s for r in rows)) for s in ['Hacker News','GitHub'])}
 
 def evidence(topic,search='',limit=100):
@@ -178,16 +187,35 @@ def evidence(topic,search='',limit=100):
  return sorted(result,key=lambda r:(r['has_pain_signal'],r['pain_score'],r['published'] or ''),reverse=True)[:limit]
 
 def competitors(topic):
- with conn() as c: return [dict(r) for r in c.execute('SELECT * FROM competitors WHERE topic=? ORDER BY id DESC',(topic,))]
+ with conn() as c:
+  return [dict(r,pricing_current=pricing_verified(r),complaint_eligible=complaint_verified(r)) for r in c.execute('SELECT * FROM competitors WHERE topic=? ORDER BY id DESC',(topic,))]
 
 def seed():
- # Pricing examples are only preloaded when sourced and labeled as externally verified reference pages.
- with conn() as c:
-  if c.execute('SELECT count(*) FROM competitors').fetchone()[0]: return
-  for name,url,price,purl,kind in [
-   ('Synder','https://synder.com/','From $65/month (monthly billed); $52/month annual billing, Basic','https://synder.com/pricing/','paid'),
-   ('Stripe Dashboard / exports','https://dashboard.stripe.com/','Included Stripe reporting and exports; platform processing fees still apply','https://docs.stripe.com/reports','free')]:
-   c.execute('INSERT INTO competitors(topic,name,url,pricing,pricing_url,kind,verified_on,created_at) VALUES(?,?,?,?,?,?,?,?)',('stripe-reconciliation',name,url,price,purl,kind,'2026-10-31',now()))
+ # Do not preload unsupported prices or verification claims.
+ pass
+
+REVIEW_KINDS = ('unreviewed','anecdote','vendor_marketing','independent_complaint','buyer_interview')
+
+def host(url):
+ return (urllib.parse.urlparse(url).hostname or '').lower().removeprefix('www.') if valid_url(url) else ''
+
+def dated(value, max_age=None):
+ try:
+  day=datetime.strptime(value,'%Y-%m-%d').date()
+  age=(datetime.now(timezone.utc).date()-day).days
+  return age >= 0 and (max_age is None or age <= max_age)
+ except (ValueError,TypeError): return False
+
+def pricing_verified(row):
+ return (row['pricing_status']=='verified' and bool(row['pricing'].strip())
+         and dated(row['verified_on'],90) and bool(host(row['url']))
+         and host(row['url'])==host(row['pricing_url']))
+
+def complaint_verified(row):
+ return (row['complaint_kind']=='independent_complaint' and bool(row['complaint'].strip())
+         and dated(row['complaint_published']) and bool(host(row['complaint_url']))
+         and host(row['complaint_url'])!=host(row['url']))
+
 
 class Handler(BaseHTTPRequestHandler):
  def log_message(self,fmt,*args): print('%s %s'%(self.address_string(),fmt%args))
@@ -218,6 +246,8 @@ class Handler(BaseHTTPRequestHandler):
  def do_POST(self):
   data=self.read_body()
   if data is None:return
+  if any(not isinstance(v,(str,type(None))) for v in data.values()):return self.send({'error':'Fields must be text'},400)
+  data={k:('' if v is None else v) for k,v in data.items()}
   if self.path=='/api/scan':
    topic=data.get('topic') or None
    if topic and (not isinstance(topic,str) or topic not in TOPICS):return self.send({'error':'Unknown topic'},400)
@@ -228,15 +258,28 @@ class Handler(BaseHTTPRequestHandler):
   if self.path=='/api/competitors':
    topic=data.get('topic');kind=data.get('kind','paid')
    if topic not in TOPICS or kind not in ('paid','free') or not data.get('name') or not data.get('url'):return self.send({'error':'Topic, name, URL, kind required'},400)
+   if data.get('pricing_status','unverified') not in ('verified','unverified') or data.get('complaint_kind','anecdote') not in REVIEW_KINDS:return self.send({'error':'Invalid evidence classification'},400)
+   for key in ('verified_on','complaint_published'):
+    if data.get(key) and not dated(data[key]):return self.send({'error':f'{key} must be a non-future YYYY-MM-DD date'},400)
    for key in ('url','pricing_url','complaint_url'):
-    if data.get(key) and urllib.parse.urlparse(data[key]).scheme not in ('http','https'):return self.send({'error':f'Invalid {key}'},400)
+    if data.get(key) and not valid_url(data[key]):return self.send({'error':f'Invalid {key}'},400)
+   if data.get('id'):
+    fields=('name','url','pricing','pricing_url','kind','complaint','complaint_url','verified_on','pricing_status','complaint_kind','complaint_published')
+    with conn() as c:
+     changed=c.execute('UPDATE competitors SET '+','.join(k+'=?' for k in fields)+' WHERE id=? AND topic=?',tuple(data.get(k,'') for k in fields)+(data['id'],topic)).rowcount
+    return self.send({'ok':True} if changed else {'error':'Competitor not found'},200 if changed else 404)
    with conn() as c:
-    c.execute('INSERT INTO competitors(topic,name,url,pricing,pricing_url,kind,complaint,complaint_url,verified_on,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(topic,data['name'][:120],data['url'],data.get('pricing','')[:400],data.get('pricing_url',''),kind,data.get('complaint','')[:1000],data.get('complaint_url',''),data.get('verified_on',''),now()))
+    c.execute('INSERT INTO competitors(topic,name,url,pricing,pricing_url,kind,complaint,complaint_url,verified_on,created_at,pricing_status,complaint_kind,complaint_published) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(topic,data['name'][:120],data['url'],data.get('pricing','')[:400],data.get('pricing_url',''),kind,data.get('complaint','')[:1000],data.get('complaint_url',''),data.get('verified_on',''),now(),data.get('pricing_status','unverified'),data.get('complaint_kind','anecdote'),data.get('complaint_published','')))
    return self.send({'ok':True})
+  if self.path=='/api/evidence/review':
+   if data.get('review_kind') not in REVIEW_KINDS:return self.send({'error':'Invalid review classification'},400)
+   with conn() as c:
+    changed=c.execute('UPDATE evidence SET review_kind=? WHERE id=? AND topic=?',(data['review_kind'],data.get('id'),data.get('topic'))).rowcount
+   return self.send({'ok':True} if changed else {'error':'Evidence not found'},200 if changed else 404)
   if self.path=='/api/decision':
    topic=data.get('topic');status=data.get('status')
    if topic not in TOPICS or status not in ('Discovery','Needs research','Customer validation','Rejected'):return self.send({'error':'Invalid topic or status'},400)
-   with conn() as c:c.execute('UPDATE decisions SET status=?,notes=?,updated_at=? WHERE topic=?',(status,str(data.get('notes',''))[:2000],now(),topic))
+   with conn() as c:c.execute('UPDATE decisions SET status=?,notes=?,updated_at=?,target_buyer=?,underserved_gap=?,next_step=? WHERE topic=?',(status,str(data.get('notes',''))[:2000],now(),str(data.get('target_buyer',''))[:1000],str(data.get('underserved_gap',''))[:2000],str(data.get('next_step',''))[:1000],topic))
    return self.send({'ok':True})
   self.send({'error':'not found'},404)
 
